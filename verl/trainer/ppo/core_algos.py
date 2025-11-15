@@ -566,6 +566,16 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     return loss
 
 
+def compute_sft_loss(
+    log_prob,
+    response_mask,
+    loss_agg_mode: str = "token-mean",
+):
+    pg_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss
+
+
 def compute_policy_loss(
     old_log_prob,
     log_prob,
@@ -630,16 +640,6 @@ def compute_policy_loss(
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
-
-
-def compute_sft_loss(
-    log_prob,
-    response_mask,
-    loss_agg_mode: str = "token-mean",
-):
-    pg_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-    return pg_loss
 
 
 @register_policy_loss("clip_cov")

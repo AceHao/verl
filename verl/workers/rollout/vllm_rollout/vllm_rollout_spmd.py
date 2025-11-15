@@ -329,33 +329,32 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            if is_validate:
-                outputs = self.inference_engine.generate(
-                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                    sampling_params=self.sampling_params,
-                    lora_request=lora_requests,
-                    use_tqdm=False,
-                )
+            outputs = self.inference_engine.generate(
+                prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                lora_request=lora_requests,
+                use_tqdm=False,
+            )
 
-                # TODO(sgm): disable logprob when recompute_log_prob is enable
-                # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+            # TODO(sgm): disable logprob when recompute_log_prob is enable
+            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
-                response = []
-                rollout_log_probs = []
-                for output in outputs:
-                    for sample_id in range(len(output.outputs)):
-                        response_ids = output.outputs[sample_id].token_ids
-                        response.append(response_ids)
-                        if self.config.calculate_log_probs:
-                            curr_log_prob = []
-                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                                curr_log_prob.append(logprob[response_ids[i]].logprob)
-                            rollout_log_probs.append(curr_log_prob)
+            response = []
+            rollout_log_probs = []
+            for output in outputs:
+                for sample_id in range(len(output.outputs)):
+                    response_ids = output.outputs[sample_id].token_ids
+                    response.append(response_ids)
+                    if self.config.calculate_log_probs:
+                        curr_log_prob = []
+                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                            curr_log_prob.append(logprob[response_ids[i]].logprob)
+                        rollout_log_probs.append(curr_log_prob)
 
-                response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-                if self.config.calculate_log_probs:
-                    rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
-                    rollout_log_probs = rollout_log_probs.to(torch.float32)
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
+            if self.config.calculate_log_probs:
+                rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+                rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             if self.sampling_params.n > 1 and do_sample and (not self.shuffle_before_dispatch):
                 idx = _repeat_interleave(idx, self.sampling_params.n)
@@ -371,17 +370,15 @@ class vLLMRollout(BaseRollout):
                 if "raw_prompt" in non_tensor_batch.keys():
                     non_tensor_batch["raw_prompt"] = _repeat_interleave(non_tensor_batch["raw_prompt"], self.sampling_params.n)
 
-            if is_validate:
-                seq = torch.cat([idx, response], dim=-1)
+            seq = torch.cat([idx, response], dim=-1)
             teacher_seq = torch.cat([idx, teacher_response], dim=-1)
 
         # for student
-        if is_validate:
-            response_length = response.size(1)
-            delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-            delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-            if position_ids.dim() == 3:  # qwen2vl mrope
-                delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
         # for teacher
         teacher_response_length = teacher_response.size(1)
         teacher_delta_position_id = torch.arange(1, teacher_response_length + 1, device=position_ids.device)
@@ -397,33 +394,23 @@ class vLLMRollout(BaseRollout):
         teacher_response_attention_mask = get_response_mask(response_id=teacher_response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         teacher_attention_mask = torch.cat((attention_mask, teacher_response_attention_mask), dim=-1)
         # for student
-        if is_validate:
-            response_position_ids = position_ids[..., -1:] + delta_position_id
-            position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-            response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
-            attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        response_position_ids = position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
         
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        if is_validate:
-            batch_dict = {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "teacher_response": teacher_response,
-                "teacher_input_ids": teacher_seq,  # here input_ids become the whole sentences
-                "teacher_attention_mask": teacher_attention_mask,
-                "teacher_position_ids": teacher_position_ids,
-            }
-        else:
-            batch_dict = {
-                "prompts": idx,
-                "teacher_response": teacher_response,
-                "teacher_input_ids": teacher_seq,  # here input_ids become the whole sentences
-                "teacher_attention_mask": teacher_attention_mask,
-                "teacher_position_ids": teacher_position_ids,
-            }
+        batch_dict = {
+            "prompts": idx,
+            "responses": response,
+            "input_ids": seq,  # here input_ids become the whole sentences
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "teacher_response": teacher_response,
+            "teacher_input_ids": teacher_seq,  # here input_ids become the whole sentences
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_position_ids": teacher_position_ids,
+        }
         if self.shuffle_before_dispatch:
             batch_dict['indices_before_dispatch'] = prompts.batch['indices_before_dispatch']
         batch = TensorDict(batch_dict, batch_size=batch_size,)

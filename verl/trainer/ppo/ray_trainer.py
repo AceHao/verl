@@ -224,8 +224,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         DataProto: The updated data with computed advantages and returns.
     """
     # Back-compatible with trainers that do not compute response mask in fit
-    if "teacher_response_mask" not in data.batch.keys():
-        data.batch["teacher_response_mask"] = compute_response_mask(data, compute_teacher=True)
+    if "response_mask" not in data.batch.keys():
+        data.batch["response_mask"] = compute_response_mask(data, compute_teacher=False)
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -245,16 +245,23 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 config.get("pf_ppo_weight_pow", 2.0),
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        grpo_calculation_mask = data.batch["teacher_response_mask"]
+        # Initialize the mask for GRPO calculation
+        grpo_calculation_mask = data.batch["response_mask"]
+        if multi_turn:
+            # If multi-turn, replace the mask with the relevant part of loss_mask
+            # Get length from the initial response mask
+            response_length = grpo_calculation_mask.size(1)
+            # This mask is the one intended for GRPO
+            grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
+        # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["teacher_token_level_rewards"],
+            token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            compute_teacher=True,
         )
-        data.batch["teacher_advantages"] = advantages
-        data.batch["teacher_returns"] = returns
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -330,8 +337,6 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
-        # NOTE: no reference policy, only teacher sft
-        self.use_reference_policy = False
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
@@ -359,8 +364,8 @@ class RayPPOTrainer:
             self.use_critic = False
         else:
             raise NotImplementedError
-        # NOTE: no critic, only teacher sft
-        self.use_critic = False
+        # NOTE: we hack critic as reward model. so always use critic
+        self.use_critic = True
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -550,22 +555,17 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, sample_inputs, sample_outputs, teacher_outputs, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, f"generation_results.jsonl")
 
-        n = len(inputs)
+        n = len(sample_inputs)
         base_data = {
-            "input": inputs,
-            "output": outputs,
-            "score": scores,
-            "step": [self.global_steps] * n,
+            "input": sample_inputs,
+            "output": sample_outputs,
+            "teacher_output": teacher_outputs,
         }
-
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
 
         lines = []
         for i in range(n):
@@ -691,7 +691,7 @@ class RayPPOTrainer:
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
-            
+
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * len(scores)))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
@@ -700,10 +700,9 @@ class RayPPOTrainer:
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                sample_inputs=sample_inputs,
+                sample_outputs=sample_outputs,
+                teacher_outputs=teacher_outputs,
                 dump_path=val_data_dir,
             )
 
@@ -915,45 +914,6 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
-    def _forward_batch_teacher_forcing_grpo(self, batch, teacher_repeat):
-
-        response_length = batch["teacher_response"].size(-1)
-        
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            input_ids = batch["teacher_input_ids"]
-            bsz, seqlen = input_ids.shape
-            attention_mask = batch["teacher_attention_mask"]
-            position_ids = batch["teacher_position_ids"]
-            
-            values = torch.zeros((bsz, response_length), device=input_ids.device)
-            response_mask = attention_mask[:, -response_length:]
-            response_lengths = response_mask.sum(dim=1).long()
-            last_token_indices = response_lengths - 1
-            for i in range(0, bsz, teacher_repeat):
-                for j in range(teacher_repeat):
-                    values[i + j, last_token_indices[i + j]] = float(j)
-            return values
-    
-    def compute_teacher_values(self, data: DataProto):
-        compute_teacher = data.meta_info["compute_teacher"]
-        if compute_teacher:
-            select_keys = ["teacher_response", "teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"]
-        else:
-            select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-        batch = data.select(batch_keys=select_keys).batch
-        
-        # teacher forcing for GRPO
-        if compute_teacher:
-            teacher_repeat = data.meta_info["teacher_repeat"]
-            uids = data.non_tensor_batch["uid"]
-            for i in range(0, len(uids), teacher_repeat):
-                assert all(uids[j] == uids[i] for j in range(i, i + teacher_repeat)), f"uids are not the same for a teacher group: {uids[i:i+teacher_repeat]}"
-            return DataProto.from_dict(
-                tensors={
-                    "teacher_values": self._forward_batch_teacher_forcing_grpo(batch, teacher_repeat=teacher_repeat)
-                }
-            )
-    
     def fit(self):
         """
         The training loop of PPO.
@@ -1009,7 +969,7 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                
+
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids", "teacher_response"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -1061,7 +1021,7 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    batch.batch["teacher_response_mask"] = compute_response_mask(batch, compute_teacher=True)
+                    batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1071,10 +1031,102 @@ class RayPPOTrainer:
                     #     self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["teacher_attention_mask"], dim=-1).tolist()
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                    
+                    # recompute old_log_probs
+                    with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        batch.meta_info["compute_teacher"] = False
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        
+                        entropys = old_log_prob.batch["entropys"]
+                        response_masks = batch.batch["response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                        metrics.update(old_log_prob_metrics)
+                        old_log_prob.batch.pop("entropys")
+                        batch = batch.union(old_log_prob)
+
+                        if "rollout_log_probs" in batch.batch.keys():
+                            # TODO: we may want to add diff of probs too.
+                            rollout_old_log_probs = batch.batch["rollout_log_probs"]
+                            actor_old_log_probs = batch.batch["old_log_probs"]
+                            attention_mask = batch.batch["attention_mask"]
+                            responses = batch.batch["responses"]
+                            response_length = responses.size(1)
+                            response_mask = attention_mask[:, -response_length:]
+
+                            rollout_probs = torch.exp(rollout_old_log_probs)
+                            actor_probs = torch.exp(actor_old_log_probs)
+                            rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
+                            rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
+                            rollout_probs_diff_max = torch.max(rollout_probs_diff)
+                            rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
+                            rollout_probs_diff_std = torch.std(rollout_probs_diff)
+                            metrics.update(
+                                {
+                                    "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
+                                    "training/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
+                                    "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
+                                }
+                            )
+
+                    if self.use_reference_policy:
+                        # compute reference log_prob
+                        with marked_timer("ref", timing_raw, color="olive"):
+                            if not self.ref_in_actor:
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            else:
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
+
+                    # NOTE: we use critic to calculate score of student here
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        future_reward = None
+                        reward_extra_infos_dict = {}
+                        batch.meta_info["compute_teacher"] = False
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
+                        reward_tensor = batch.batch["values"]
+
+                    with marked_timer("adv", timing_raw, color="brown"):
+                        # we combine with rule-based rm
+                        reward_extra_infos_dict: dict[str, list]
+                        if self.config.reward_model.launch_reward_fn_async:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        batch.batch["token_level_scores"] = reward_tensor
+                        
+                        if reward_extra_infos_dict:
+                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        # compute rewards. apply_kl_penalty if available
+                        if self.config.algorithm.use_kl_in_reward:
+                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # compute advantages, executed on the driver process
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                            config=self.config.algorithm,
+                        )
+
+                    # update critic
+                    if self.use_critic:
+                        with marked_timer("update_critic", timing_raw, color="pink"):
+                            critic_output = self.critic_wg.update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
+
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
@@ -1120,6 +1172,7 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

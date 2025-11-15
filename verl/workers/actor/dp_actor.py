@@ -395,10 +395,13 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = [
+            "responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages",
             "teacher_response", "teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"
         ]
         if multi_turn:
             select_keys.append("loss_mask")
+        if self.config.use_kl_loss:
+            select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -436,7 +439,7 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len, compute_teacher=True)
+                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len, compute_teacher=False)
                 else:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches
@@ -458,13 +461,20 @@ class DataParallelPPOActor(BasePPOActor):
                                 data[k] = v
                     else:
                         data = data.to(get_device_id())  # actor device is cpu when using offload
+                    responses = data["responses"]
                     teacher_response = data["teacher_response"]
+                    response_length = responses.size(1)
                     teacher_response_length = teacher_response.size(1)
+                    attention_mask = data["attention_mask"]
                     teacher_attention_mask = data["teacher_attention_mask"]
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
+                        response_mask = attention_mask[:, -response_length:]
                         teacher_response_mask = teacher_attention_mask[:, -teacher_response_length:]
+
+                    old_log_prob = data["old_log_probs"]
+                    advantages = data["advantages"]
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -492,8 +502,14 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config)
 
-                    policy_loss = pg_loss
-                    
+                    if entropy_coeff != 0:
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                        # compute policy loss
+                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                    else:
+                        policy_loss = pg_loss
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
