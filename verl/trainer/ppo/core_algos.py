@@ -205,7 +205,6 @@ def compute_grpo_outcome_advantage(
     index: np.ndarray,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: str = True,
-    compute_teacher: bool = False,
 ):
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -230,7 +229,6 @@ def compute_grpo_outcome_advantage(
     scores = token_level_rewards.sum(dim=-1)
 
     id2score = defaultdict(list)
-    id2adv = defaultdict(list)
     id2mean = {}
     id2std = {}
 
@@ -252,12 +250,6 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
-            id2adv[index[i]].append(scores[i])
-        
-        if compute_teacher:
-            for i in range(bsz):
-                scores[i] = max(id2adv[index[i]])
-        
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
@@ -564,16 +556,6 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
     return loss
-
-
-def compute_sft_loss(
-    log_prob,
-    response_mask,
-    loss_agg_mode: str = "token-mean",
-):
-    pg_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-    return pg_loss
 
 
 def compute_policy_loss(

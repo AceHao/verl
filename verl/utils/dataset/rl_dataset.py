@@ -267,7 +267,7 @@ class RLHFDataset(Dataset):
         
         if teacher_response is not None:
             teacher_response = self.tokenizer(teacher_response, return_tensors="pt", add_special_tokens=False)
-        
+
         if not self.processor_type == "MiniCPMVImageProcessor":
             input_ids, attention_mask = verl_F.postprocess_data(
                 input_ids=input_ids,

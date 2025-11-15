@@ -712,16 +712,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            if data.meta_info["compute_teacher"]:
-                output = DataProto.from_dict(
-                    tensors={"teacher_old_log_probs": output, "entropys": entropys},
-                    meta_info={"temperature": self.config.rollout.temperature},
-                )
-            else:
-                output = DataProto.from_dict(
-                    tensors={"old_log_probs": output, "entropys": entropys},
-                    meta_info={"temperature": self.config.rollout.temperature},
-                )
+            output = DataProto.from_dict(
+                tensors={"old_log_probs": output, "entropys": entropys},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
@@ -1107,10 +1101,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             values = self.critic.compute_values(data=data)
-            if data.meta_info["compute_teacher"]:
-                output = DataProto.from_dict(tensors={"teacher_values": values})
-            else: 
-                output = DataProto.from_dict(tensors={"values": values})
+            output = DataProto.from_dict(tensors={"values": values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         output = output.to("cpu")

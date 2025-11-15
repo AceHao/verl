@@ -148,24 +148,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values = values * last_token_mask.type_as(values)
             return values
 
-    def _forward_batch_teacher_forcing_grpo(self, batch, teacher_repeat):
-        response_length = batch["teacher_response"].size(-1)
-        
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            input_ids = batch["teacher_input_ids"]
-            bsz, seqlen = input_ids.shape
-            attention_mask = batch["teacher_attention_mask"]
-            position_ids = batch["teacher_position_ids"]
-            
-            values = torch.zeros((bsz, response_length), device=input_ids.device)
-            response_mask = attention_mask[:, -response_length:]
-            response_lengths = response_mask.sum(dim=1).long()
-            last_token_indices = response_lengths - 1
-            for i in range(0, bsz, teacher_repeat):
-                for j in range(teacher_repeat):
-                    values[i + j, last_token_indices[i + j]] = float(j)
-            return values
-    
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
@@ -186,7 +168,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def compute_values(self, data: DataProto) -> torch.Tensor:
-        compute_teacher = data.meta_info["compute_teacher"]
+        compute_teacher = False # currently we only compute student values
         self.critic_module.eval()
         micro_batch_size = data.meta_info["micro_batch_size"]
         if compute_teacher:
@@ -196,14 +178,6 @@ class DataParallelPPOCritic(BasePPOCritic):
         batch = data.select(batch_keys=select_keys).batch
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-
-        # teacher forcing for GRPO
-        if compute_teacher:
-            teacher_repeat = data.meta_info["teacher_repeat"]
-            uids = data.non_tensor_batch["uid"]
-            for i in range(0, len(uids), teacher_repeat):
-                assert all(uids[j] == uids[i] for j in range(i, i + teacher_repeat)), f"uids are not the same for a teacher group: {uids[i:i+teacher_repeat]}"
-            return self._forward_batch_teacher_forcing_grpo(batch, teacher_repeat=teacher_repeat)
 
         if has_multi_modal_inputs:
             num_micro_batches = data.batch.batch_size[0] // micro_batch_size

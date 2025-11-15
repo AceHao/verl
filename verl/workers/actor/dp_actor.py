@@ -28,7 +28,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_sft_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -79,16 +79,13 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, compute_teacher, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
-        if compute_teacher:
-            response_length = micro_batch["teacher_response"].size(-1)
-        else:
-            response_length = micro_batch["responses"].size(-1)
+        response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             for key in micro_batch["multi_modal_inputs"][0].keys():
@@ -101,16 +98,10 @@ class DataParallelPPOActor(BasePPOActor):
                     multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            if compute_teacher:
-                input_ids = micro_batch["teacher_input_ids"]
-                batch_size, seqlen = input_ids.shape
-                attention_mask = micro_batch["teacher_attention_mask"]
-                position_ids = micro_batch["teacher_position_ids"]
-            else:
-                input_ids = micro_batch["input_ids"]
-                batch_size, seqlen = input_ids.shape
-                attention_mask = micro_batch["attention_mask"]
-                position_ids = micro_batch["position_ids"]
+            input_ids = micro_batch["input_ids"]
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
@@ -315,7 +306,6 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             torch.Tensor: the log_prob tensor
         """
-        compute_teacher = data.meta_info["compute_teacher"]
         # set to eval
         self.actor_module.eval()
 
@@ -324,10 +314,7 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
         def _get_micro_batches(data: DataProto) -> Tuple[list, list | None]:
-            if compute_teacher:
-                select_keys = ["teacher_response", "teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"]
-            else:
-                select_keys = ["responses", "input_ids", "attention_mask", "position_ids"] 
+            select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
             batch = data.select(batch_keys=select_keys).batch
             has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch
 
@@ -352,7 +339,7 @@ class DataParallelPPOActor(BasePPOActor):
                     return micro_batches_dp, None
             elif use_dynamic_bsz:
                 max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-                micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len, compute_teacher=compute_teacher)
+                micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
                 return micro_batches, indices
             else:
                 micro_batches = batch.split(micro_batch_size)
@@ -366,7 +353,7 @@ class DataParallelPPOActor(BasePPOActor):
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(micro_batch, compute_teacher=compute_teacher, temperature=temperature, calculate_entropy=calculate_entropy)
+                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -387,17 +374,13 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
-
         # make sure we are in training mode
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = [
-            "responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages",
-            "teacher_response", "teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"
-        ]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -439,7 +422,7 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len, compute_teacher=False)
+                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches
@@ -462,16 +445,12 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         data = data.to(get_device_id())  # actor device is cpu when using offload
                     responses = data["responses"]
-                    teacher_response = data["teacher_response"]
                     response_length = responses.size(1)
-                    teacher_response_length = teacher_response.size(1)
                     attention_mask = data["attention_mask"]
-                    teacher_attention_mask = data["teacher_attention_mask"]
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
-                        teacher_response_mask = teacher_attention_mask[:, -teacher_response_length:]
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
@@ -487,17 +466,22 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    teacher_entropy, teacher_log_prob = self._forward_micro_batch(micro_batch=data, compute_teacher=True, temperature=temperature, calculate_entropy=calculate_entropy)
+                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                     if self.config.policy_loss.loss_mode == "vanilla":
-                        teacher_pg_loss = compute_sft_loss(
-                            log_prob=teacher_log_prob,
-                            response_mask=teacher_response_mask,
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
                             loss_agg_mode=loss_agg_mode,
                         )
-                        pg_loss = teacher_pg_loss
                     else:
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config)
@@ -510,6 +494,16 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
+                    if self.config.use_kl_loss:
+                        ref_log_prob = data["ref_log_prob"]
+                        # compute kl loss
+                        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        metrics["actor/kl_loss"] = kl_loss.detach().item()
+                        metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
@@ -519,7 +513,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
-                        "actor/teacher_pg_loss": teacher_pg_loss.detach().item(),
+                        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                        "actor/ppo_kl": ppo_kl.detach().item(),
+                        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
                     append_to_dict(metrics, data)
 

@@ -180,7 +180,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_response_mask(data: DataProto, compute_teacher=False):
+def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
     This function extracts the portion of the attention mask that corresponds to the model's response,
@@ -192,16 +192,10 @@ def compute_response_mask(data: DataProto, compute_teacher=False):
     Returns:
         torch.Tensor: The attention mask for the response tokens.
     """
-    if compute_teacher:
-        responses = data.batch["teacher_response"]
-        response_length = responses.size(1)
-        attention_mask = data.batch["teacher_attention_mask"]
-        return attention_mask[:, -response_length:]
-    else:
-        responses = data.batch["responses"]
-        response_length = responses.size(1)
-        attention_mask = data.batch["attention_mask"]
-        return attention_mask[:, -response_length:]
+    responses = data.batch["responses"]
+    response_length = responses.size(1)
+    attention_mask = data.batch["attention_mask"]
+    return attention_mask[:, -response_length:]
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None):
@@ -225,7 +219,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     """
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
-        data.batch["response_mask"] = compute_response_mask(data, compute_teacher=False)
+        data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -555,17 +549,22 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, sample_inputs, sample_outputs, teacher_outputs, dump_path):
+    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"generation_results.jsonl")
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
-        n = len(sample_inputs)
+        n = len(inputs)
         base_data = {
-            "input": sample_inputs,
-            "output": sample_outputs,
-            "teacher_output": teacher_outputs,
+            "input": inputs,
+            "output": outputs,
+            "score": scores,
+            "step": [self.global_steps] * n,
         }
+
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
 
         lines = []
         for i in range(n):
@@ -700,9 +699,10 @@ class RayPPOTrainer:
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             self._dump_generations(
-                sample_inputs=sample_inputs,
-                sample_outputs=sample_outputs,
-                teacher_outputs=teacher_outputs,
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
             )
 
@@ -886,11 +886,12 @@ class RayPPOTrainer:
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
+        # NOTE: have directly loaded from actor_rollout_ref.model.path and critic.model.path
         # load actor
-        self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        # self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # load critic
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        # if self.use_critic and os.path.exists(critic_path):
+        #     self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
         # load dataloader,
         # TODO: from remote not implemented yet
@@ -1035,9 +1036,7 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        batch.meta_info["compute_teacher"] = False
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1084,10 +1083,10 @@ class RayPPOTrainer:
                     with marked_timer("reward", timing_raw, color="yellow"):
                         future_reward = None
                         reward_extra_infos_dict = {}
-                        batch.meta_info["compute_teacher"] = False
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
                         reward_tensor = batch.batch["values"]
+                        # reward_tensor: (bsz, response_length)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
@@ -1095,7 +1094,7 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
-                        
+
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
@@ -1107,6 +1106,7 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
+
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
                         batch = compute_advantage(
