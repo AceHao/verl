@@ -117,7 +117,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                 # pad it back
                 values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
                 
-                # values = values[:, -response_length - 1 : -1]
                 values = values[:, -response_length:] # NOTE: the line above is for critic usage, that we predict the value of *next* token. but since we hack it for reward model, we change it to predict the value of the *current* token.
                 response_mask = attention_mask[:, -response_length:]
                 response_lengths = response_mask.sum(dim=1).long()
@@ -139,7 +138,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                     values = output[2]
                 else:
                     values = output.logits
-                # values = values[:, -response_length - 1 : -1].squeeze(-1)
                 values = values[:, -response_length:].squeeze(-1) # NOTE: the line above is for critic usage, that we predict the value of *next* token. but since we hack it for reward model, we change it to predict the value of the *current* token.
                 response_mask = attention_mask[:, -response_length:]
                 response_lengths = response_mask.sum(dim=1).long()
@@ -251,7 +249,6 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module.train()
         metrics = {}
 
-        # select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
         select_keys = [
             "input_ids", "responses", "attention_mask", "position_ids",
             "teacher_input_ids", "teacher_response", "teacher_attention_mask", "teacher_position_ids"
@@ -310,14 +307,6 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     # assert not torch.any(torch.isnan(vpreds)).item()
 
-                    # vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                    #     vpreds=vpreds,
-                    #     values=values,
-                    #     returns=returns,
-                    #     response_mask=response_mask,
-                    #     cliprange_value=self.config.cliprange_value,
-                    #     loss_agg_mode=self.config.loss_agg_mode,
-                    # )
                     d_loss = core_algos.compute_discriminator_loss(
                         student_vpreds=student_vpreds,
                         teacher_vpreds=teacher_vpreds,
