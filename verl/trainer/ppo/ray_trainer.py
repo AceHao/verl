@@ -359,7 +359,7 @@ class RayPPOTrainer:
             self.use_critic = False
         else:
             raise NotImplementedError
-        # NOTE: no critic, only teacher sft
+        # NOTE: no critic eval only
         self.use_critic = False
 
         self._validate_config()
@@ -550,22 +550,19 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, sample_inputs, sample_outputs, teacher_outputs, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        name = self.config.trainer.val_data
+        name = f"{name}_"
+        filename = os.path.join(dump_path, f"{name}generation_results.jsonl")
 
-        n = len(inputs)
+        n = len(sample_inputs)
         base_data = {
-            "input": inputs,
-            "output": outputs,
-            "score": scores,
-            "step": [self.global_steps] * n,
+            "input": sample_inputs,
+            "output": sample_outputs,
+            "teacher_output": teacher_outputs,
         }
-
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
 
         lines = []
         for i in range(n):
@@ -672,7 +669,7 @@ class RayPPOTrainer:
             teacher_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in teacher_ids]
             sample_outputs.extend(output_texts)
             teacher_outputs.extend(teacher_texts)
-
+            
             test_batch = test_batch.union(test_output_gen_batch)
 
             # use rouge-L with error handling for recursion issues
@@ -691,7 +688,7 @@ class RayPPOTrainer:
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
-            
+
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * len(scores)))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
@@ -700,10 +697,9 @@ class RayPPOTrainer:
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                sample_inputs=sample_inputs,
+                sample_outputs=sample_outputs,
+                teacher_outputs=teacher_outputs,
                 dump_path=val_data_dir,
             )
 
@@ -868,6 +864,7 @@ class RayPPOTrainer:
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
+                print("Using auto mode, global_step_folder not found")
                 print("Training from scratch")
                 return 0
         else:
@@ -878,6 +875,11 @@ class RayPPOTrainer:
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
+                if not os.path.exists(global_step_folder):
+                    print("Using resume_path mode, global_step_folder not found")
+                    print("Training from scratch")
+                    return 0
+        
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
@@ -887,6 +889,9 @@ class RayPPOTrainer:
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
+        if not os.path.exists(actor_path):
+            print(f"Warning: No actor checkpoint found at {actor_path}, will start from scratch")
+            return 0
         # load actor
         self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # load critic
