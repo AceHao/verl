@@ -21,6 +21,7 @@ import itertools
 import logging
 import os
 from typing import Tuple
+import numpy as np
 
 import torch
 from torch import nn
@@ -385,6 +386,39 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def deduplicate_by_uid(self, data_proto):
+        """
+        Deduplicate a DataProto object based on `non_tensor_batch['uid']`,
+        keeping only the first occurrence for each unique uid.
+
+        This function assumes that:
+        - The batch dimension is along dim 0.
+        - All tensor fields in `batch` and all entries in `non_tensor_batch`
+        are aligned along the same batch dimension.
+        """
+        # Ensure uid exists in non-tensor batch
+        assert "uid" in data_proto.non_tensor_batch, (
+            "`uid` is not found in data_proto.non_tensor_batch"
+        )
+
+        # uid array of shape [B], dtype=object
+        uids = data_proto.non_tensor_batch["uid"]
+        assert isinstance(uids, np.ndarray)
+
+        seen = set()
+        keep_idxs = []
+
+        # Keep the first occurrence of each uid
+        for i, uid in enumerate(uids):
+            if uid not in seen:
+                seen.add(uid)
+                keep_idxs.append(i)
+
+        # Use the existing DataProto indexing utility to slice
+        # both tensor and non-tensor fields consistently
+        return data_proto.select_idxs(keep_idxs)
+
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
 
@@ -393,6 +427,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
+
+        data = self.deduplicate_by_uid(data)
 
         select_keys = [
             "responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages",
