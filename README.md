@@ -18,6 +18,15 @@ There are four branches in this repo: `seqkd` branch for running the SeqKD basel
 
 For SeqKD and warmup stage of GAD, the student is supervised-finetuned on the teacher response (corresponding code at [sft_seqkd](https://github.com/YTianZHU/verl/blob/seqkd/verl/workers/actor/dp_actor.py#L485) and [sft_warmup](https://github.com/YTianZHU/verl/blob/warmup/verl/workers/actor/dp_actor.py#L495)). We choose to use this VeRL-based repo to implement them for best alignment.
 
+### Code Guide
+
+We provide a code walk-through of this branch `gad`.
+
+- [Training Entrance](https://github.com/YTianZHU/verl/blob/gad/verl/trainer/ppo/ray_trainer.py#L918)
+- Student Rollout: [Entrance](https://github.com/YTianZHU/verl/blob/gad/verl/trainer/ppo/ray_trainer.py#L996) and [Implementation](https://github.com/YTianZHU/verl/blob/gad/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py#L257)
+- Discriminator Update with BT Loss: [Entrance](https://github.com/YTianZHU/verl/blob/gad/verl/trainer/ppo/ray_trainer.py#L1126) and [Implementation](https://github.com/YTianZHU/verl/blob/gad/verl/workers/critic/dp_critic.py#L284)
+- Student Update with Discriminator Score: [Entrance](https://github.com/YTianZHU/verl/blob/gad/verl/trainer/ppo/ray_trainer.py#L1135) and [Implementation](https://github.com/YTianZHU/verl/blob/gad/verl/workers/actor/dp_actor.py#L474)
+
 
 ## 📄 Citation
 
