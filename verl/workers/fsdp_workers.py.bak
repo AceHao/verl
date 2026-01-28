@@ -967,9 +967,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                 "target_modules": convert_to_regular_types(self.config.model.target_modules),
                 "bias": "none",
             }
-            # [PATCH] Fix for Qwen3 Critic missing prepare_inputs_for_generation
-            if not hasattr(critic_module, 'prepare_inputs_for_generation'):
-                critic_module.prepare_inputs_for_generation = lambda *args, **kwargs: kwargs
             critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
 
         if self.rank == 0:
