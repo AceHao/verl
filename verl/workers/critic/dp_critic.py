@@ -23,6 +23,7 @@ import torch
 import torch.distributed
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
@@ -301,8 +302,18 @@ class DataParallelPPOCritic(BasePPOCritic):
                     response_mask = attention_mask[:, -response_length:]
                     teacher_response_mask = teacher_attention_mask[:, -teacher_response_length:]
 
-                    student_vpreds = self._forward_micro_batch(data, compute_teacher=False)
-                    teacher_vpreds = self._forward_micro_batch(data, compute_teacher=True)
+                    # Use checkpointing to avoid holding both forward activations simultaneously.
+                    # During backward, forwards will be recomputed - algorithm is identical,
+                    # but peak activation memory is reduced from 2x to 1x.
+                    micro_batch_data = data  # Capture for closure
+                    student_vpreds = torch_checkpoint(
+                        lambda: self._forward_micro_batch(micro_batch_data, compute_teacher=False),
+                        use_reentrant=False
+                    )
+                    teacher_vpreds = torch_checkpoint(
+                        lambda: self._forward_micro_batch(micro_batch_data, compute_teacher=True),
+                        use_reentrant=False
+                    )
                     d_acc = (teacher_vpreds.sum(dim=-1) > student_vpreds.sum(dim=-1)).float().mean().detach().item()
 
                     # assert not torch.any(torch.isnan(vpreds)).item()
