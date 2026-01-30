@@ -56,6 +56,14 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
 
+    def _checkpointed_forward(self, dummy_tensor, micro_batch, compute_teacher):
+        """Wrapper for checkpointing that takes a dummy tensor to enable gradient tracking.
+
+        The dummy_tensor must have requires_grad=True to make use_reentrant=True work.
+        We use preserve_rng_state=True (default) to ensure MoE routing is deterministic.
+        """
+        return self._forward_micro_batch(micro_batch, compute_teacher)
+
     def _forward_micro_batch(self, micro_batch, compute_teacher):
         if compute_teacher:
             response_length = micro_batch["teacher_response"].size(-1)
@@ -302,19 +310,21 @@ class DataParallelPPOCritic(BasePPOCritic):
                     response_mask = attention_mask[:, -response_length:]
                     teacher_response_mask = teacher_attention_mask[:, -teacher_response_length:]
 
-                    # Use checkpointing to avoid holding both forward activations simultaneously.
-                    # During backward, forwards will be recomputed - algorithm is identical,
-                    # but peak activation memory is reduced from 2x to 1x.
-                    # Note: use_reentrant=True is required for MoE models (like Qwen3-235B-A22B)
-                    # where expert routing is non-deterministic between forward passes.
-                    micro_batch_data = data  # Capture for closure
+                    # Use checkpointing to reduce peak memory from 2x to 1x activations.
+                    # A dummy tensor with requires_grad=True is needed for use_reentrant=True.
+                    # preserve_rng_state=True (default) ensures MoE routing is deterministic.
+                    dummy = torch.tensor(1.0, device=responses.device, requires_grad=True)
                     student_vpreds = torch_checkpoint(
-                        lambda: self._forward_micro_batch(micro_batch_data, compute_teacher=False),
-                        use_reentrant=True
+                        self._checkpointed_forward,
+                        dummy, data, False,  # dummy_tensor, micro_batch, compute_teacher
+                        use_reentrant=True,
+                        preserve_rng_state=True
                     )
                     teacher_vpreds = torch_checkpoint(
-                        lambda: self._forward_micro_batch(micro_batch_data, compute_teacher=True),
-                        use_reentrant=True
+                        self._checkpointed_forward,
+                        dummy, data, True,  # dummy_tensor, micro_batch, compute_teacher
+                        use_reentrant=True,
+                        preserve_rng_state=True
                     )
                     d_acc = (teacher_vpreds.sum(dim=-1) > student_vpreds.sum(dim=-1)).float().mean().detach().item()
 
