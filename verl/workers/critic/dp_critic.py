@@ -1,4 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+            # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -305,14 +305,18 @@ class DataParallelPPOCritic(BasePPOCritic):
                     # Use checkpointing to avoid holding both forward activations simultaneously.
                     # During backward, forwards will be recomputed - algorithm is identical,
                     # but peak activation memory is reduced from 2x to 1x.
+                    # Note: determinism_check="none" is required for MoE models (like Qwen3-235B-A22B)
+                    # where expert routing can vary between forward passes.
                     micro_batch_data = data  # Capture for closure
                     student_vpreds = torch_checkpoint(
                         lambda: self._forward_micro_batch(micro_batch_data, compute_teacher=False),
-                        use_reentrant=False
+                        use_reentrant=False,
+                        determinism_check="none"
                     )
                     teacher_vpreds = torch_checkpoint(
                         lambda: self._forward_micro_batch(micro_batch_data, compute_teacher=True),
-                        use_reentrant=False
+                        use_reentrant=False,
+                        determinism_check="none"
                     )
                     d_acc = (teacher_vpreds.sum(dim=-1) > student_vpreds.sum(dim=-1)).float().mean().detach().item()
 
